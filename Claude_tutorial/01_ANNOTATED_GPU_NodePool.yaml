@@ -1,0 +1,338 @@
+# ============================================================================
+# HEAVILY ANNOTATED: GPU NodePool Configuration for EKS + Karpenter
+# ============================================================================
+#
+# FILE PURPOSE:
+# This file defines a "NodePool" - a template that tells Karpenter (the EKS
+# autoscaler) WHAT TYPE of EC2 instances to provision when your GPU workloads
+# need compute resources.
+#
+# ANALOGY FOR AI RESEARCHERS:
+# Think of this as a "procurement policy" for your compute cluster. When you
+# submit a GPU-based inference job, Karpenter reads this file and says:
+# "I need to rent a GPU instance from AWS. Let me check the gpu-inference
+# NodePool to see what specifications to request."
+#
+# WHY THIS MATTERS:
+# Without this file, your vLLM Pods requesting GPUs would stay in "Pending"
+# state forever because Kubernetes wouldn't know how to provision GPU nodes.
+#
+# ============================================================================
+
+---
+# ----------------------------------------------------------------------------
+# SECTION 1: NodePool Resource Definition
+# ----------------------------------------------------------------------------
+# This is a Kubernetes Custom Resource (CR) defined by the Karpenter operator.
+# The "apiVersion" tells Kubernetes this is a Karpenter v1 NodePool.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  # The "name" is how other resources reference this NodePool.
+  # The vLLM deployment will use "nodeSelector" to target this pool.
+  name: gpu-inference
+
+# ----------------------------------------------------------------------------
+# SECTION 2: Resource Limits - Prevent Runaway Costs
+# ----------------------------------------------------------------------------
+spec:
+  limits:
+    # WHAT: Maximum total CPU cores Karpenter can provision for this NodePool
+    # WHY: Prevents accidental over-provisioning (cost control)
+    # EXAMPLE: If each GPU instance has 64 CPUs, this allows ~16 instances
+    cpu: 1024
+
+    # WHAT: Maximum total memory Karpenter can provision
+    # WHY: Additional safety limit (1024 vCPUs * 8GB per vCPU = 8192GB)
+    memory: 8192Gi
+
+  # ----------------------------------------------------------------------------
+  # SECTION 3: Disruption Policy - When to Remove Nodes
+  # ----------------------------------------------------------------------------
+  disruption:
+    # WHAT: When should Karpenter delete underutilized nodes?
+    # OPTIONS:
+    #   - WhenEmpty: Only delete completely empty nodes
+    #   - WhenEmptyOrUnderutilized: Delete nodes with low utilization
+    # WHY: Saves costs by removing idle GPU instances (which are expensive!)
+    consolidationPolicy: WhenEmptyOrUnderutilized
+
+    # WHAT: Wait 30 minutes before deleting an underutilized node
+    # WHY: Prevents thrashing (repeatedly creating/deleting nodes)
+    # ANALOGY: Like a "grace period" before firing an idle worker
+    consolidateAfter: 30m
+
+  # ----------------------------------------------------------------------------
+  # SECTION 4: Node Template - Labels and Configuration
+  # ----------------------------------------------------------------------------
+  template:
+    metadata:
+      # LABELS: Key-value pairs attached to the provisioned EC2 instances
+      # USAGE: Pods can use "nodeSelector" to target specific node types
+      labels:
+        # Custom label to identify this as a GPU inference node
+        # Pods can select nodes with: nodeSelector.model-inferencing: "gpu-inference"
+        model-inferencing: "gpu-inference"
+
+        # Label indicating this is NOT a Ray control plane node
+        # (Ray has separate head/worker architecture)
+        ray-control-plane: "false"
+
+        # Label indicating NVIDIA GPU presence
+        # Allows pods to select: nodeSelector.nvidia.com/gpu: "present"
+        nvidia.com/gpu: "present"
+
+    spec:
+      # ----------------------------------------------------------------------------
+      # SUBSECTION 4.1: Node Class Reference - Links to EC2 Configuration
+      # ----------------------------------------------------------------------------
+      # WHAT: Points to the EC2NodeClass (defined below) that specifies AWS details
+      # WHY: Separates Kubernetes config from AWS-specific config
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu-inference  # Must match the EC2NodeClass name below
+
+      # WHAT: Delete this node after 8 hours regardless of usage
+      # WHY: Forces periodic node refresh for security patches and cost optimization
+      expireAfter: 8h
+
+      # ----------------------------------------------------------------------------
+      # SUBSECTION 4.2: Requirements - EC2 Instance Selection Criteria
+      # ----------------------------------------------------------------------------
+      # These are FILTERS that tell Karpenter which EC2 instance types to consider
+      requirements:
+
+        # REQUIREMENT 1: Instance Category
+        # WHAT: Only provision instances in the "g" category (GPU instances)
+        # AWS NAMING: g5.xlarge, g6.2xlarge, etc. (g = GPU category)
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values:
+          - g
+
+        # REQUIREMENT 2: Instance Family
+        # WHAT: Only use g5 or g6 families (latest GPU generations)
+        # WHY:
+        #   - g5: NVIDIA A10G Tensor Core GPUs (good price/performance)
+        #   - g6: NVIDIA L4 GPUs (newer, more efficient)
+        # AVOID: g4dn (older generation, less efficient)
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["g5", "g6"]
+
+        # REQUIREMENT 3: CPU Architecture
+        # WHAT: Only x86_64 (amd64) instances
+        # WHY: Most GPU instances and ML frameworks are x86_64
+        # NOTE: ARM64 GPU instances don't exist yet in AWS
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+
+        # REQUIREMENT 4: Operating System
+        # WHAT: Only Linux nodes
+        # WHY: All ML inference frameworks run on Linux
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+
+        # REQUIREMENT 5: Capacity Type
+        # WHAT: Only provision On-Demand instances (not Spot)
+        # WHY:
+        #   - On-Demand: Guaranteed availability, never interrupted
+        #   - Spot: 70% cheaper but can be terminated by AWS anytime
+        # PRODUCTION: Use On-Demand for critical inference workloads
+        # DEV/TEST: Consider Spot to save costs
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+
+        # REQUIREMENT 6: GPU Manufacturer
+        # WHAT: Only NVIDIA GPUs (not AMD or other)
+        # WHY: vLLM and most ML frameworks require NVIDIA CUDA
+        - key: karpenter.k8s.aws/instance-gpu-manufacturer
+          operator: In
+          values: ["nvidia"]
+
+        # REQUIREMENT 7: GPU Count
+        # WHAT: Only instances with exactly 4 GPUs
+        # WHY: Matches the vLLM deployment's requirement for tensor parallelism
+        # EXAMPLES OF 4-GPU INSTANCES:
+        #   - g5.12xlarge: 4x NVIDIA A10G (24GB each)
+        #   - g6.12xlarge: 4x NVIDIA L4 (24GB each)
+        - key: karpenter.k8s.aws/instance-gpu-count
+          operator: In
+          values: ["4"]
+
+---
+# ============================================================================
+# SECTION 5: EC2NodeClass - AWS-Specific Configuration
+# ============================================================================
+# This defines the actual AWS EC2 instance configuration (AMI, storage, IAM, etc.)
+# Think of this as the "hardware specification" while NodePool is the "procurement policy"
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu-inference  # Must match nodeClassRef.name above
+
+spec:
+  # ----------------------------------------------------------------------------
+  # SUBSECTION 5.1: Kubelet Configuration - Kubernetes Agent Settings
+  # ----------------------------------------------------------------------------
+  kubelet:
+    # WHAT: Maximum 2 Pods per CPU core
+    # WHY: Prevents oversubscription (GPU workloads are resource-intensive)
+    # EXAMPLE: 64-core instance = max 128 Pods (but GPU limit will be lower)
+    podsPerCore: 2
+
+    # WHAT: Hard cap of 20 Pods per node
+    # WHY: GPU nodes run fewer, larger workloads (not microservices)
+    maxPods: 20
+
+    # WHAT: Reserve resources for system processes (kubelet, OS)
+    # WHY: Ensures node stability under load
+    systemReserved:
+      cpu: 500m      # Reserve 0.5 CPU cores for system
+      memory: 900Mi  # Reserve 900MB RAM for system
+
+  # ----------------------------------------------------------------------------
+  # SUBSECTION 5.2: Network Configuration - VPC Subnet Selection
+  # ----------------------------------------------------------------------------
+  # WHAT: Which VPC subnets can these GPU nodes be placed in?
+  # HOW: Karpenter searches for subnets matching ALL these tags
+  subnetSelectorTerms:
+    - tags:
+        # Must be in "dev" environment
+        Environment: dev
+
+        # Must be a private subnet (for security - no direct internet access)
+        # Pattern matches: eks-cluster-name-private-us-east-1a, etc.
+        Name: ${CLUSTER_NAME}-private-*
+
+        # Must have Karpenter discovery tag
+        # This tag is added by the EKS cluster setup
+        karpenter.sh/discovery: ${CLUSTER_NAME}
+
+  # ----------------------------------------------------------------------------
+  # SUBSECTION 5.3: Security Group Selection
+  # ----------------------------------------------------------------------------
+  # WHAT: Which security groups (firewall rules) to attach to GPU nodes?
+  # WHY: Controls network traffic to/from the nodes
+  securityGroupSelectorTerms:
+    - tags:
+        Environment: dev
+        karpenter.sh/discovery: ${CLUSTER_NAME}
+
+  # ----------------------------------------------------------------------------
+  # SUBSECTION 5.4: AMI (Amazon Machine Image) Configuration
+  # ----------------------------------------------------------------------------
+  # WHAT: Amazon Linux 2023 optimized for EKS with NVIDIA drivers pre-installed
+  # WHY: AL2023 is the latest, most secure Amazon Linux version
+  amiFamily: "AL2023"
+
+  # WHAT: Specific AMI version to use
+  # PATTERN BREAKDOWN:
+  #   - amazon-eks-node: EKS-optimized AMI
+  #   - al2023: Amazon Linux 2023
+  #   - x86_64: CPU architecture
+  #   - nvidia: Includes NVIDIA GPU drivers and CUDA
+  #   - 1.33: Kubernetes version
+  #   - v*: Latest patch version
+  amiSelectorTerms:
+    - name: "amazon-eks-node-al2023-x86_64-nvidia-1.33-v*"
+
+  # ----------------------------------------------------------------------------
+  # SUBSECTION 5.5: IAM Role for Node
+  # ----------------------------------------------------------------------------
+  # WHAT: IAM role that gives the node permissions to AWS services
+  # WHY: Nodes need to:
+  #   - Pull container images from ECR
+  #   - Write logs to CloudWatch
+  #   - Access EBS volumes
+  #   - Communicate with EKS control plane
+  role: KarpenterNode-${CLUSTER_NAME}
+
+  # ----------------------------------------------------------------------------
+  # SUBSECTION 5.6: Resource Tags
+  # ----------------------------------------------------------------------------
+  # WHAT: Tags applied to the EC2 instance for cost tracking and organization
+  tags:
+    Environment: dev
+    karpenter.sh/discovery: ${CLUSTER_NAME}
+    model-inferencing: "gpu-inference"
+    ray-control-plane: "false"
+    Provisioned-By: aws-solutions-library-samples/guidance-for-automated-provisioning-of-application-ready-amazon-eks-clusters
+
+  # ----------------------------------------------------------------------------
+  # SUBSECTION 5.7: Storage Configuration (EBS Volume)
+  # ----------------------------------------------------------------------------
+  # WHAT: Configuration for the root EBS volume attached to the instance
+  blockDeviceMappings:
+  - deviceName: /dev/xvda  # Standard root device name for AL2023
+    ebs:
+      # SIZE: 500GB root volume
+      # WHY: Need space for:
+      #   - OS (10GB)
+      #   - Docker images (50GB)
+      #   - Model weights cached from Hugging Face (300GB+)
+      #   - vLLM KV cache and swap space
+      volumeSize: 500Gi
+
+      # TYPE: GP3 (General Purpose SSD v3)
+      # WHY: Latest generation, better price/performance than GP2
+      volumeType: gp3
+
+      # IOPS: 10,000 input/output operations per second
+      # WHY: Fast model loading from disk
+      # NOTE: GP3 baseline is 3000 IOPS, we're paying for extra performance
+      iops: 10000
+
+      # ENCRYPTION: Disabled (can enable for compliance)
+      # PRODUCTION: Set to "true" and specify KMS key
+      encrypted: false
+
+      # DELETE ON TERMINATION: Delete volume when node is deleted
+      # WHY: Prevents orphaned volumes (cost leak)
+      # NOTE: Model weights are cached from Hugging Face, not stored permanently
+      deleteOnTermination: true
+
+      # THROUGHPUT: 512 MB/s
+      # WHY: Fast sequential reads when loading large model files
+      # NOTE: GP3 baseline is 125 MB/s, we're paying for 4x speed
+      throughput: 512
+
+# ============================================================================
+# END OF FILE - Summary of Data Flow
+# ============================================================================
+#
+# WHEN A vLLM POD IS CREATED:
+#
+# 1. Pod YAML specifies:
+#    - resources.requests.nvidia.com/gpu: 4
+#    - nodeSelector.karpenter.sh/nodepool: gpu-inference
+#    - tolerations for "model-inferencing=gpu-inference" taint
+#
+# 2. Karpenter sees the pending Pod and:
+#    a. Reads this NodePool to understand requirements
+#    b. Finds an EC2 instance type matching all requirements (e.g., g5.12xlarge)
+#    c. Provisions the instance with the EC2NodeClass configuration
+#    d. Waits for the node to join the cluster (~5 minutes)
+#
+# 3. Kubernetes schedules the Pod onto the new node
+#
+# 4. vLLM container starts and detects 4 NVIDIA GPUs via CUDA
+#
+# 5. vLLM loads the model with tensor parallelism across 4 GPUs
+#
+# 6. Service is ready to handle inference requests
+#
+# COST OPTIMIZATION NOTES:
+# - g5.12xlarge: ~$5/hour (4x A10G GPUs)
+# - With consolidationPolicy, idle nodes are deleted after 30min
+# - Total cost: (# of hours with active requests) * $5
+#
+# TROUBLESHOOTING:
+# - If Pod stays Pending: Check requirements match available instance types
+# - If node fails to join: Check IAM role permissions and AMI availability
+# - If GPU not detected: Ensure NVIDIA AMI and GPU device plugin are installed
+# ============================================================================
