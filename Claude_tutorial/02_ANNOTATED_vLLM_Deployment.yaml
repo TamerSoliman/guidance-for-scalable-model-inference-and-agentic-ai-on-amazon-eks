@@ -1,0 +1,506 @@
+# ============================================================================
+# HEAVILY ANNOTATED: vLLM Inference Server Deployment
+# ============================================================================
+#
+# FILE PURPOSE:
+# This file deploys a high-throughput LLM inference server using vLLM on GPU nodes.
+# It demonstrates how to run production-grade model serving on Kubernetes.
+#
+# WHAT IS vLLM?
+# vLLM is a fast and memory-efficient inference engine for Large Language Models.
+# It uses advanced techniques like:
+#   - PagedAttention: Manages GPU memory like OS manages RAM (virtual memory)
+#   - Continuous batching: Processes multiple requests simultaneously
+#   - Tensor parallelism: Splits model across multiple GPUs
+#
+# ANALOGY FOR AI RESEARCHERS:
+# Think of this as deploying a "Flask API" for your model, but optimized for:
+#   - Serving 100s of concurrent requests
+#   - Maximizing GPU utilization (90%+)
+#   - Minimizing latency with smart batching
+#
+# MODEL BEING SERVED:
+# Qwen3-14B - A 14 billion parameter reasoning model from Alibaba Cloud
+#
+# ============================================================================
+
+---
+# ----------------------------------------------------------------------------
+# RESOURCE 1: PersistentVolumeClaim - Storage for Model Weights
+# ----------------------------------------------------------------------------
+# WHAT: A request for persistent storage (like requesting a hard drive)
+# WHY: Model weights are large (28GB for Qwen3-14B) and should be cached
+#      to avoid re-downloading from Hugging Face on every Pod restart
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-qwen-server
+  annotations:
+    # WHAT: Disable PVC protection (allows deletion)
+    # WHY: During dev/test, we want to clean up resources easily
+    # PRODUCTION: Set to "true" to prevent accidental deletion
+    kubernetes.io/pvc-protection: "false"
+
+spec:
+  # ACCESS MODE: ReadWriteOnce
+  # MEANING: Only one node can mount this volume at a time
+  # WHY: EBS volumes can only attach to one instance
+  # IMPLICATION: Pods must run on the same node or wait for volume detachment
+  accessModes:
+  - ReadWriteOnce
+
+  resources:
+    requests:
+      # SIZE: 900GB
+      # WHY:
+      #   - Model weights: ~28GB (FP16)
+      #   - Hugging Face cache: ~100GB (multiple model versions)
+      #   - Headroom for future models: ~700GB
+      storage: 900Gi
+
+  # STORAGE CLASS: gp3 (defined in base_eks_setup/gp3.yaml)
+  # WHAT: Tells Kubernetes to provision a GP3 EBS volume
+  # GP3 BENEFITS:
+  #   - Baseline: 3000 IOPS, 125 MB/s
+  #   - Cost-effective for model storage
+  #   - Can burst to higher performance if needed
+  storageClassName: gp3
+
+  # VOLUME MODE: Filesystem (vs. Block)
+  # MEANING: Mounted as a regular filesystem (ext4)
+  volumeMode: Filesystem
+
+---
+# ----------------------------------------------------------------------------
+# RESOURCE 2: Deployment - The Main Inference Server
+# ----------------------------------------------------------------------------
+# WHAT: A Deployment manages a set of identical Pods (replicas)
+# WHY: Provides:
+#   - Automatic restart if Pod crashes
+#   - Rolling updates for new model versions
+#   - Declarative desired state
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-qwen-server
+  labels:
+    app: vllm-qwen-server
+
+spec:
+  # ----------------------------------------------------------------------------
+  # REPLICAS: Number of Pods to run
+  # ----------------------------------------------------------------------------
+  # WHAT: Run 1 copy of this Pod
+  # WHY: Each Pod needs 4 GPUs, and we have limited GPU quota
+  # SCALING: To serve more traffic, increase replicas (if you have GPU quota)
+  # ALTERNATIVE: Use HorizontalPodAutoscaler to auto-scale based on metrics
+  replicas: 1
+
+  # ----------------------------------------------------------------------------
+  # SELECTOR: Which Pods does this Deployment manage?
+  # ----------------------------------------------------------------------------
+  selector:
+    matchLabels:
+      app: vllm-qwen-server
+
+  # ----------------------------------------------------------------------------
+  # POD TEMPLATE: Blueprint for each Pod
+  # ----------------------------------------------------------------------------
+  template:
+    metadata:
+      labels:
+        app: vllm-qwen-server
+
+    spec:
+      # --------------------------------------------------------------------------
+      # NODE SELECTION: Where should this Pod run?
+      # --------------------------------------------------------------------------
+      # NODE SELECTOR: Hard requirement - MUST run on nodes with these labels
+      nodeSelector:
+        # REQUIREMENT 1: AMD64 architecture (x86_64)
+        kubernetes.io/arch: amd64
+
+        # REQUIREMENT 2: Node must have NVIDIA GPU
+        # This label is set by the GPU NodePool
+        nvidia.com/gpu: present
+
+        # REQUIREMENT 3: Must be a gpu-inference NodePool node
+        # This ensures Pods land on the right Karpenter-provisioned nodes
+        karpenter.sh/nodepool: gpu-inference
+
+      # --------------------------------------------------------------------------
+      # TOLERATIONS: Allow scheduling on "tainted" nodes
+      # --------------------------------------------------------------------------
+      # WHAT IS A TAINT?
+      # Taints are like "repellent" - they prevent Pods from scheduling on a node
+      # unless the Pod has a matching "toleration" (like an antidote).
+      #
+      # WHY USE TAINTS?
+      # Prevents non-GPU workloads from accidentally landing on expensive GPU nodes.
+      #
+      # EXAMPLE:
+      # GPU node has taint: "model-inferencing=gpu-inference:NoSchedule"
+      # This Pod tolerates that taint, so it CAN schedule there.
+      tolerations:
+      - key: "model-inferencing"
+        operator: "Equal"
+        value: "gpu-inference"
+        effect: "NoSchedule"
+
+      # --------------------------------------------------------------------------
+      # VOLUMES: Storage to mount into the container
+      # --------------------------------------------------------------------------
+      volumes:
+      # VOLUME 1: Persistent cache for Hugging Face model downloads
+      - name: cache-volume
+        persistentVolumeClaim:
+          claimName: vllm-qwen-server  # Links to PVC defined above
+
+      # VOLUME 2: Shared memory for tensor parallelism
+      # WHAT: tmpfs (RAM-backed filesystem)
+      # WHY: vLLM uses shared memory for inter-GPU communication during
+      #      tensor parallel inference. Default /dev/shm is 64MB, way too small.
+      # SIZE: 32GB (large enough for KV cache sharing between GPUs)
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: "32Gi"
+
+      # --------------------------------------------------------------------------
+      # CONTAINERS: The actual workload
+      # --------------------------------------------------------------------------
+      containers:
+      - name: vllm-qwen-server
+
+        # CONTAINER IMAGE
+        # WHAT: Official vLLM image with OpenAI-compatible API server
+        # TAG: "latest" (for dev) - in production, pin to specific version
+        # ALTERNATIVE: vllm/vllm-openai:v0.7.3 (pinned version)
+        image: vllm/vllm-openai:latest
+
+        # ----------------------------------------------------------------------
+        # CONTAINER COMMAND: How to start vLLM
+        # ----------------------------------------------------------------------
+        # WHAT: Override the default entrypoint with a shell command
+        command: ["/bin/sh", "-c"]
+
+        # vLLM SERVE COMMAND BREAKDOWN:
+        # This is the most important line - it configures the entire inference server
+        args: [
+          # BASE COMMAND: vllm serve <model_name>
+          "vllm serve Qwen/Qwen3-14B \
+
+          # PARAMETER 1: Enable automatic tool calling
+          # WHAT: Allows the model to invoke functions/tools
+          # WHY: Needed for agentic workflows where LLM calls external APIs
+          --enable-auto-tool-choice \
+
+          # PARAMETER 2: Tool call parser
+          # WHAT: Format for function calling (Hermes is a popular format)
+          # WHY: Standardizes how tool calls are structured in responses
+          --tool-call-parser hermes \
+
+          # PARAMETER 3: Trust remote code
+          # WHAT: Allow custom model code from Hugging Face
+          # WHY: Some models have custom tokenizers or modeling code
+          # SECURITY: Only use with trusted models (risk of code execution)
+          --trust-remote-code \
+
+          # PARAMETER 4: Maximum batched tokens
+          # WHAT: Max total tokens across all requests in a batch
+          # WHY: Larger = more requests batched = higher throughput
+          # TRADEOFF: Larger = more GPU memory used
+          # VALUE: 32768 tokens (~25,000 words across all requests)
+          --max-num-batched-tokens 32768 \
+
+          # PARAMETER 5: Maximum sequences in batch
+          # WHAT: Max number of concurrent requests to batch together
+          # WHY: More concurrent requests = better GPU utilization
+          # TRADEOFF: More sequences = less memory per request
+          # VALUE: 8 concurrent requests
+          --max-num-seqs 8 \
+
+          # PARAMETER 6: Maximum model sequence length
+          # WHAT: Max context window per request
+          # WHY: Qwen3-14B supports 32K token context
+          # CONSTRAINT: Limited by GPU memory (32GB per GPU)
+          --max-model-len 32768 \
+
+          # PARAMETER 7: Data type
+          # WHAT: Use bfloat16 precision (16-bit brain floating point)
+          # WHY:
+          #   - FP32: Original model precision (28GB * 2 = 56GB)
+          #   - FP16: Half precision (28GB)
+          #   - BF16: Same size as FP16 but better for training/inference
+          # BENEFIT: Fits in GPU memory, minimal accuracy loss
+          --dtype bfloat16 \
+
+          # PARAMETER 8: Tensor parallelism
+          # WHAT: Split model across 4 GPUs
+          # WHY:
+          #   - Model size: ~28GB (FP16)
+          #   - Single GPU memory: 24GB (A10G)
+          #   - Splitting across 4 GPUs: ~7GB per GPU (fits easily!)
+          # PERFORMANCE: Each GPU computes different layers in parallel
+          --tensor-parallel-size 4 \
+
+          # PARAMETER 9: GPU memory utilization
+          # WHAT: Use 90% of GPU memory for model and KV cache
+          # WHY:
+          #   - 100%: Risk of OOM (out of memory) crashes
+          #   - 90%: Safe headroom for memory fragmentation
+          #   - Lower: Wastes expensive GPU memory
+          --gpu-memory-utilization 0.90"
+        ]
+
+        # ----------------------------------------------------------------------
+        # ENVIRONMENT VARIABLES: Runtime configuration
+        # ----------------------------------------------------------------------
+        env:
+        # VAR 1: Hugging Face token for downloading private models
+        # WHAT: Secret token from Hugging Face (like an API key)
+        # WHY: Required to download model weights from Hugging Face Hub
+        # SECURITY: Stored in Kubernetes Secret, not hardcoded
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+
+        # VAR 2: OpenMP thread count
+        # WHAT: Number of CPU threads for parallel CPU operations
+        # WHY: Some ops (tokenization) use CPU threading
+        # VALUE: 8 threads (balance between parallelism and overhead)
+        - name: OMP_NUM_THREADS
+          value: "8"
+
+        # VAR 3: vLLM logging level
+        # WHAT: How verbose should vLLM logs be?
+        # OPTIONS: DEBUG, INFO, WARNING, ERROR
+        # WHY: DEBUG for troubleshooting, INFO for production
+        - name: VLLM_LOGGING_LEVEL
+          value: "DEBUG"
+
+        # VAR 4: Disable compile cache
+        # WHAT: Whether to cache PyTorch compiled kernels
+        # VALUE: 0 = caching enabled (speeds up restarts)
+        - name: VLLM_DISABLE_COMPILE_CACHE
+          value: "0"
+
+        # VAR 5: CUDA visible devices (COMMENTED OUT)
+        # WHAT: Which GPUs should vLLM see?
+        # VALUE: "0,1,2,3" = all 4 GPUs
+        # WHY COMMENTED: vLLM auto-detects all available GPUs
+        # WHEN TO USE: Limit vLLM to specific GPUs if sharing node
+        # - name: CUDA_VISIBLE_DEVICES
+        #   value: "0,1,2,3"
+
+        # ----------------------------------------------------------------------
+        # PORTS: Network endpoints exposed by the container
+        # ----------------------------------------------------------------------
+        ports:
+        # PORT 8000: vLLM OpenAI-compatible API server
+        # ENDPOINTS:
+        #   - POST /v1/completions: Text completion
+        #   - POST /v1/chat/completions: Chat completion
+        #   - GET /v1/models: List available models
+        #   - GET /health: Health check
+        - containerPort: 8000
+
+        # ----------------------------------------------------------------------
+        # RESOURCE REQUESTS AND LIMITS: How much compute to allocate
+        # ----------------------------------------------------------------------
+        # CRITICAL CONCEPT:
+        # - REQUESTS: Minimum guaranteed resources (used for scheduling)
+        # - LIMITS: Maximum resources allowed (enforced by Kubernetes)
+        resources:
+          # LIMITS: Maximum resources this container can use
+          limits:
+            # MEMORY: 64GB
+            # WHY: Generous limit for model weights + KV cache
+            # BREAKDOWN:
+            #   - Model weights: ~7GB per GPU × 4 = 28GB
+            #   - KV cache: ~20GB (for batched requests)
+            #   - Python overhead: ~5GB
+            #   - Headroom: ~11GB
+            memory: 64Gi
+
+            # GPU: 4 NVIDIA GPUs
+            # WHAT: Request 4 complete GPUs
+            # WHY: Matches tensor-parallel-size=4
+            # KUBERNETES: This triggers Karpenter to provision a 4-GPU instance
+            nvidia.com/gpu: "4"
+
+          # REQUESTS: Minimum resources for scheduling
+          requests:
+            # CPU: 22 cores
+            # WHY: Need CPU for:
+            #   - Tokenization (CPU-bound)
+            #   - Data preprocessing
+            #   - Networking
+            # NOTE: g5.12xlarge has 48 vCPUs, we're requesting ~half
+            cpu: "22"
+
+            # MEMORY: Same as limit (no memory overcommitment)
+            memory: 64Gi
+
+            # GPU: Same as limit
+            # IMPORTANT: GPU requests must equal limits (no sharing)
+            nvidia.com/gpu: "4"
+
+        # ----------------------------------------------------------------------
+        # VOLUME MOUNTS: Attach volumes to container filesystem
+        # ----------------------------------------------------------------------
+        volumeMounts:
+        # MOUNT 1: Hugging Face cache directory
+        # WHAT: Mount PVC at /root/.cache/huggingface
+        # WHY: This is where transformers library caches downloaded models
+        # BENEFIT: Models persist across Pod restarts (no re-download)
+        - mountPath: /root/.cache/huggingface
+          name: cache-volume
+
+        # MOUNT 2: Shared memory
+        # WHAT: Mount RAM-backed tmpfs at /dev/shm
+        # WHY: vLLM uses shared memory for tensor parallelism
+        - name: shm
+          mountPath: /dev/shm
+
+        # ----------------------------------------------------------------------
+        # LIVENESS PROBE: Is the container healthy?
+        # ----------------------------------------------------------------------
+        # WHAT: Kubernetes periodically checks this endpoint
+        # WHY: If checks fail, Kubernetes kills and restarts the container
+        # USE CASE: Detect deadlocks or crashes
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+
+          # PARAMETER 1: Initial delay
+          # WHAT: Wait 240 seconds before first check
+          # WHY: Model loading takes ~3-4 minutes
+          #   - Download weights from Hugging Face: ~1 min
+          #   - Load into GPU memory: ~1 min
+          #   - Initialize KV cache: ~30 sec
+          #   - Warmup: ~30 sec
+          initialDelaySeconds: 240
+
+          # PARAMETER 2: Check period
+          # WHAT: Check every 10 seconds
+          periodSeconds: 10
+
+          # PARAMETER 3: Failure threshold
+          # WHAT: 30 consecutive failures before restart
+          # WHY: 30 × 10s = 5 minutes grace period
+          # RATIONALE: Avoid restart during temporary slowdowns
+          failureThreshold: 30
+
+          # PARAMETER 4: Success threshold
+          # WHAT: 1 success marks container as healthy
+          successThreshold: 1
+
+        # ----------------------------------------------------------------------
+        # READINESS PROBE: Is the container ready to serve traffic?
+        # ----------------------------------------------------------------------
+        # WHAT: Kubernetes uses this to decide if Pod should receive traffic
+        # WHY: Service only routes requests to "Ready" Pods
+        # DIFFERENCE FROM LIVENESS:
+        #   - Liveness: Health (bad = restart)
+        #   - Readiness: Availability (bad = remove from load balancer)
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+
+          # Similar timing to liveness probe
+          initialDelaySeconds: 240
+          periodSeconds: 10
+
+---
+# ----------------------------------------------------------------------------
+# RESOURCE 3: Service - Stable Network Endpoint
+# ----------------------------------------------------------------------------
+# WHAT: A Service provides a stable IP and DNS name for accessing Pods
+# WHY: Pods are ephemeral (can be deleted/recreated), but Service IP is stable
+#
+# ANALOGY:
+# - Pods = individual servers with changing IPs
+# - Service = load balancer with fixed IP
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-qwen-server
+
+spec:
+  ports:
+  # PORT MAPPING:
+  # - Service listens on port 8000
+  # - Forwards to Pod's containerPort 8000
+  - name: http-vllm-qwen-server
+    port: 8000
+    protocol: TCP
+    targetPort: 8000
+
+  # SELECTOR: Which Pods does this Service route to?
+  # MATCHING: Any Pod with label "app: vllm-qwen-server"
+  selector:
+    app: vllm-qwen-server
+
+  # SESSION AFFINITY: None
+  # MEANING: Requests are load-balanced randomly across Pods
+  # ALTERNATIVE: "ClientIP" - same client always goes to same Pod
+  # WHY None: Stateless inference, no session needed
+  sessionAffinity: None
+
+  # SERVICE TYPE: ClusterIP
+  # MEANING: Service is only accessible within the cluster
+  # ALTERNATIVES:
+  #   - LoadBalancer: Exposes Service via AWS ELB (public internet)
+  #   - NodePort: Exposes on each node's IP
+  # WHY ClusterIP: vLLM is accessed via LiteLLM gateway, not directly
+  type: ClusterIP
+
+# ============================================================================
+# END OF FILE - Data Flow Summary
+# ============================================================================
+#
+# REQUEST LIFECYCLE:
+#
+# 1. CLIENT → LiteLLM Gateway (port 4000)
+#    Client sends: POST /v1/chat/completions
+#
+# 2. LiteLLM → vLLM Service (port 8000)
+#    LiteLLM routes to: http://vllm-qwen-server:8000/v1/chat/completions
+#
+# 3. Service → Pod (via label selector)
+#    Service load-balances to Pod with label "app: vllm-qwen-server"
+#
+# 4. Pod → vLLM Container (port 8000)
+#    Container processes request:
+#    a. Tokenize input (CPU)
+#    b. Load tokens into GPU memory
+#    c. Run inference across 4 GPUs (tensor parallel)
+#    d. Generate tokens autoregressively
+#    e. Decode tokens to text (CPU)
+#    f. Return JSON response
+#
+# 5. Response flows back: Pod → Service → LiteLLM → Client
+#
+# PERFORMANCE CHARACTERISTICS:
+# - Cold start: ~4 minutes (model loading)
+# - Warm latency: ~50ms per token (for 14B model)
+# - Throughput: ~100 tokens/second (with batching)
+# - Concurrent requests: Up to 8 (max-num-seqs)
+#
+# COST ANALYSIS (g5.12xlarge in us-east-1):
+# - Hourly cost: ~$5.67/hour
+# - Cost per 1M tokens: ~$0.50 (assuming 50% utilization)
+# - Optimization: Auto-scale replicas based on queue depth
+#
+# TROUBLESHOOTING CHECKLIST:
+# ✓ Pod stuck in Pending: Check GPU node availability
+# ✓ Pod CrashLoopBackOff: Check logs (model download failed?)
+# ✓ Slow startup: Normal for large models (wait 4+ minutes)
+# ✓ OOM errors: Reduce max-num-seqs or max-model-len
+# ✓ Low throughput: Increase max-num-batched-tokens
+# ============================================================================
